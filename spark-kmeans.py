@@ -64,29 +64,27 @@ GCS_CONNECTOR_URL = (
 )
 
 
-def _ensure_gcs_connector() -> bool:
-    """Descarga el conector GCS hadoop a SPARK_HOME/jars/ si no está presente.
+def _ensure_gcs_connector() -> str:
+    """Descarga el conector GCS a SPARK_HOME/jars/ si no está presente.
 
-    El conector es necesario para que Spark (JVM) pueda leer rutas gs://.
-    En máquinas de GCP con service account la autenticación es automática.
-    Retorna True si el conector quedó disponible.
+    Retorna la ruta absoluta al JAR para que Spark lo distribuya a los
+    workers via spark.jars. Si no se puede descargar retorna cadena vacía.
     """
     spark_home = os.environ.get("SPARK_HOME", "")
     if not spark_home:
         print("  ADVERTENCIA: SPARK_HOME no definido; no se puede instalar el conector GCS.")
-        return False
+        return ""
     jar_dest = os.path.join(spark_home, "jars", GCS_CONNECTOR_JAR)
-    if os.path.exists(jar_dest):
-        return True
-    print(f"  Descargando conector GCS → {jar_dest} ...")
-    try:
-        import urllib.request
-        urllib.request.urlretrieve(GCS_CONNECTOR_URL, jar_dest)
-        print("  Conector GCS descargado correctamente.")
-        return True
-    except Exception as exc:
-        print(f"  ADVERTENCIA: No se pudo descargar el conector GCS: {exc}")
-        return False
+    if not os.path.exists(jar_dest):
+        print(f"  Descargando conector GCS → {jar_dest} ...")
+        try:
+            import urllib.request
+            urllib.request.urlretrieve(GCS_CONNECTOR_URL, jar_dest)
+            print("  Conector GCS descargado correctamente.")
+        except Exception as exc:
+            print(f"  ADVERTENCIA: No se pudo descargar el conector GCS: {exc}")
+            return ""
+    return jar_dest
 
 
 # ---------------------------------------------------------------------------
@@ -112,21 +110,23 @@ def get_path(base: str, filename: str) -> str:
     return os.path.join(base, filename)
 
 
-def create_spark_session(local_mode: bool, use_gcs: bool = False) -> SparkSession:
+def create_spark_session(local_mode: bool, gcs_jar: str = "") -> SparkSession:
     """Crea la SparkSession.
 
     En modo local (pruebas) se fuerza master=local[*].
     En modo cluster el master ya viene configurado por spark-submit,
     por lo que NO se sobreescribe aquí.
-    Si use_gcs=True se configura el driver de Hadoop para leer gs:// con
-    autenticación automática via Application Default Credentials (service account).
+    Si gcs_jar es la ruta a un JAR del conector GCS, Spark lo distribuye
+    automáticamente a todos los workers y configura el driver de Hadoop.
     """
     builder = SparkSession.builder.appName("UserSegmentation_KMeans")
     if local_mode:
         builder = builder.master("local[*]")
-    if use_gcs:
+    if gcs_jar:
         builder = (
             builder
+            # Distribuir el JAR a todos los executors/workers
+            .config("spark.jars", gcs_jar)
             .config("spark.hadoop.fs.gs.impl",
                     "com.google.cloud.hadoop.fs.gcs.GoogleHadoopFileSystem")
             .config("spark.hadoop.fs.AbstractFileSystem.gs.impl",
@@ -475,16 +475,16 @@ def main():
         print(f"Modo LOCAL — dataset: {data_path}")
 
     # -----------------------------------------------------------------------
-    # Conector GCS: descarga automática si es necesario
+    # Conector GCS: descarga automática y distribución a workers si es necesario
     # -----------------------------------------------------------------------
-    use_gcs = data_path.startswith("gs://")
-    if use_gcs:
-        _ensure_gcs_connector()
+    gcs_jar = ""
+    if data_path.startswith("gs://"):
+        gcs_jar = _ensure_gcs_connector()
 
     # -----------------------------------------------------------------------
     # Inicializar Spark
     # -----------------------------------------------------------------------
-    spark = create_spark_session(local_mode, use_gcs=use_gcs)
+    spark = create_spark_session(local_mode, gcs_jar=gcs_jar)
     print(f"Spark version: {spark.version}")
 
     # -----------------------------------------------------------------------
