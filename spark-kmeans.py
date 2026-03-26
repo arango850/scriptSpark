@@ -7,8 +7,11 @@ Dataset: MovieLens 100K
 Uso local (pruebas):
     python spark-kmeans.py
 
-Uso en cluster (spark-submit):
-    spark-submit --master spark://master:7077 spark-kmeans.py gs://ml-100k
+Uso en cluster (spark-submit) — el dataset GCS se detecta automáticamente en Linux:
+    spark-submit --master spark://master.us-central1-c.c.lab5-20261.internal:7077 spark-kmeans.py
+
+O pasando una ruta explícita:
+    spark-submit --master spark://master.us-central1-c.c.lab5-20261.internal:7077 spark-kmeans.py gs://ml-100k/ml-100k
 """
 
 import sys
@@ -51,6 +54,42 @@ from pyspark.ml.clustering import KMeans
 from pyspark.ml.evaluation import ClusteringEvaluator
 
 # ---------------------------------------------------------------------------
+# GCS — ruta por defecto del bucket en Google Cloud y conector Hadoop
+# ---------------------------------------------------------------------------
+GCS_DATASET_PATH  = "gs://ml-100k/ml-100k"
+GCS_CONNECTOR_JAR = "gcs-connector-hadoop3-latest.jar"
+GCS_CONNECTOR_URL = (
+    "https://storage.googleapis.com/hadoop-lib/gcs/"
+    + GCS_CONNECTOR_JAR
+)
+
+
+def _ensure_gcs_connector() -> bool:
+    """Descarga el conector GCS hadoop a SPARK_HOME/jars/ si no está presente.
+
+    El conector es necesario para que Spark (JVM) pueda leer rutas gs://.
+    En máquinas de GCP con service account la autenticación es automática.
+    Retorna True si el conector quedó disponible.
+    """
+    spark_home = os.environ.get("SPARK_HOME", "")
+    if not spark_home:
+        print("  ADVERTENCIA: SPARK_HOME no definido; no se puede instalar el conector GCS.")
+        return False
+    jar_dest = os.path.join(spark_home, "jars", GCS_CONNECTOR_JAR)
+    if os.path.exists(jar_dest):
+        return True
+    print(f"  Descargando conector GCS → {jar_dest} ...")
+    try:
+        import urllib.request
+        urllib.request.urlretrieve(GCS_CONNECTOR_URL, jar_dest)
+        print("  Conector GCS descargado correctamente.")
+        return True
+    except Exception as exc:
+        print(f"  ADVERTENCIA: No se pudo descargar el conector GCS: {exc}")
+        return False
+
+
+# ---------------------------------------------------------------------------
 # Nombres de géneros según el README del dataset (orden exacto del u.item)
 # ---------------------------------------------------------------------------
 GENRE_NAMES = [
@@ -73,16 +112,27 @@ def get_path(base: str, filename: str) -> str:
     return os.path.join(base, filename)
 
 
-def create_spark_session(local_mode: bool) -> SparkSession:
+def create_spark_session(local_mode: bool, use_gcs: bool = False) -> SparkSession:
     """Crea la SparkSession.
 
     En modo local (pruebas) se fuerza master=local[*].
     En modo cluster el master ya viene configurado por spark-submit,
     por lo que NO se sobreescribe aquí.
+    Si use_gcs=True se configura el driver de Hadoop para leer gs:// con
+    autenticación automática via Application Default Credentials (service account).
     """
     builder = SparkSession.builder.appName("UserSegmentation_KMeans")
     if local_mode:
         builder = builder.master("local[*]")
+    if use_gcs:
+        builder = (
+            builder
+            .config("spark.hadoop.fs.gs.impl",
+                    "com.google.cloud.hadoop.fs.gcs.GoogleHadoopFileSystem")
+            .config("spark.hadoop.fs.AbstractFileSystem.gs.impl",
+                    "com.google.cloud.hadoop.fs.gcs.GoogleHadoopFS")
+            .config("spark.hadoop.google.cloud.auth.service.account.enable", "true")
+        )
     spark = builder.getOrCreate()
     spark.sparkContext.setLogLevel("WARN")
     return spark
@@ -408,19 +458,33 @@ def main():
     # Determinar ruta del dataset y modo de ejecución
     # -----------------------------------------------------------------------
     if len(sys.argv) > 1:
+        # Ruta explícita pasada como argumento (local o gs://)
         data_path  = sys.argv[1]
-        local_mode = False          # spark-submit gestiona el master
+        local_mode = False
         print(f"Modo CLUSTER — dataset: {data_path}")
+    elif sys.platform != "win32":
+        # Linux / GCP: usar el bucket de Cloud Storage por defecto
+        data_path  = GCS_DATASET_PATH
+        local_mode = False
+        print(f"Modo CLUSTER (GCS) — dataset: {data_path}")
     else:
+        # Windows: modo local con el dataset incluido en el repositorio
         script_dir = os.path.dirname(os.path.abspath(__file__))
         data_path  = os.path.join(script_dir, "ml-100k")
         local_mode = True
         print(f"Modo LOCAL — dataset: {data_path}")
 
     # -----------------------------------------------------------------------
+    # Conector GCS: descarga automática si es necesario
+    # -----------------------------------------------------------------------
+    use_gcs = data_path.startswith("gs://")
+    if use_gcs:
+        _ensure_gcs_connector()
+
+    # -----------------------------------------------------------------------
     # Inicializar Spark
     # -----------------------------------------------------------------------
-    spark = create_spark_session(local_mode)
+    spark = create_spark_session(local_mode, use_gcs=use_gcs)
     print(f"Spark version: {spark.version}")
 
     # -----------------------------------------------------------------------
