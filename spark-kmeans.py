@@ -2,16 +2,16 @@
 spark-kmeans.py
 ---------------
 Segmentación de Usuarios con K-Means usando Apache Spark
-Dataset: MovieLens 100K
+Soporta: MovieLens 100K y MovieLens 1M (detección automática por ruta)
 
 Uso local (pruebas):
-    python spark-kmeans.py
+    python spark-kmeans.py                             # ML-100K local
+    python spark-kmeans.py path/to/ml-1m               # ML-1M local
 
-Uso en cluster (spark-submit) — el dataset GCS se detecta automáticamente en Linux:
+Uso en cluster (spark-submit) — en Linux usa GCS por defecto (ML-100K):
     spark-submit --master spark://master.us-central1-c.c.lab5-20261.internal:7077 spark-kmeans.py
-
-O pasando una ruta explícita:
-    spark-submit --master spark://master.us-central1-c.c.lab5-20261.internal:7077 spark-kmeans.py gs://ml-100k/ml-100k
+    spark-submit --master spark://master.us-central1-c.c.lab5-20261.internal:7077 spark-kmeans.py gs://ml-100k/ml-1m
+    spark-submit --master spark://master.us-central1-c.c.lab5-20261.internal:7077 spark-kmeans.py gs://otro-bucket/ml-1m
 """
 
 import sys
@@ -56,8 +56,9 @@ from pyspark.ml.evaluation import ClusteringEvaluator
 # ---------------------------------------------------------------------------
 # GCS — ruta por defecto del bucket en Google Cloud y conector Hadoop
 # ---------------------------------------------------------------------------
-GCS_DATASET_PATH  = "gs://ml-100k/ml-100k"
-GCS_CONNECTOR_JAR = "gcs-connector-hadoop3-latest.jar"
+GCS_DATASET_PATH    = "gs://ml-100k/ml-100k"   # MovieLens 100K (defecto en Linux)
+GCS_DATASET_PATH_1M = "gs://ml-100k/ml-1m"     # MovieLens 1M en el mismo bucket
+GCS_CONNECTOR_JAR   = "gcs-connector-hadoop3-latest.jar"
 GCS_CONNECTOR_URL = (
     "https://storage.googleapis.com/hadoop-lib/gcs/"
     + GCS_CONNECTOR_JAR
@@ -88,7 +89,7 @@ def _ensure_gcs_connector() -> str:
 
 
 # ---------------------------------------------------------------------------
-# Nombres de géneros según el README del dataset (orden exacto del u.item)
+# Nombres de géneros (columnas internas, basadas en ML-100K u.item)
 # ---------------------------------------------------------------------------
 GENRE_NAMES = [
     "unknown", "Action", "Adventure", "Animation", "Childrens",
@@ -96,6 +97,29 @@ GENRE_NAMES = [
     "FilmNoir", "Horror", "Musical", "Mystery", "Romance",
     "SciFi", "Thriller", "War", "Western",
 ]
+
+# Mapeo de nombres de género en ML-1M → nombre interno de columna.
+# ML-1M usa "Children's", "Film-Noir" y "Sci-Fi"; no tiene "unknown".
+ML1M_GENRE_MAP = {
+    "Action":      "Action",
+    "Adventure":   "Adventure",
+    "Animation":   "Animation",
+    "Children's":  "Childrens",
+    "Comedy":      "Comedy",
+    "Crime":       "Crime",
+    "Documentary": "Documentary",
+    "Drama":       "Drama",
+    "Fantasy":     "Fantasy",
+    "Film-Noir":   "FilmNoir",
+    "Horror":      "Horror",
+    "Musical":     "Musical",
+    "Mystery":     "Mystery",
+    "Romance":     "Romance",
+    "Sci-Fi":      "SciFi",
+    "Thriller":    "Thriller",
+    "War":         "War",
+    "Western":     "Western",
+}
 
 # ---------------------------------------------------------------------------
 # Utilidades
@@ -108,6 +132,19 @@ def get_path(base: str, filename: str) -> str:
     if base.startswith("gs://"):
         return f"{base.rstrip('/')}/{filename}"
     return os.path.join(base, filename)
+
+
+def detect_format(data_path: str) -> str:
+    """Detecta el formato del dataset según el nombre del último segmento de ruta.
+
+    Retorna '1m' si el directorio se llama 'ml-1m' o 'ml_1m' (insensible a
+    mayúsculas), '100k' en cualquier otro caso. Funciona con rutas locales
+    y URIs de GCS.
+    """
+    base = data_path.rstrip("/").replace("\\", "/").split("/")[-1].lower()
+    if base in ("ml-1m", "ml_1m", "1m"):
+        return "1m"
+    return "100k"
 
 
 def create_spark_session(local_mode: bool, gcs_jar: str = "") -> SparkSession:
@@ -139,57 +176,104 @@ def create_spark_session(local_mode: bool, gcs_jar: str = "") -> SparkSession:
 
 
 # ---------------------------------------------------------------------------
-# Carga de datos
+# Carga de datos — soporta ML-100K y ML-1M
 # ---------------------------------------------------------------------------
 
-def load_ratings(spark: SparkSession, data_path: str):
-    """Carga los ratings desde u1.base (tab-separated).
-    Columnas: userId | movieId | rating | timestamp
+def _read_coloncolon(spark: SparkSession, path: str, col_names: list):
+    """Lee un archivo con separador '::' (usado en ML-1M).
+
+    PySpark no garantiza soporte de separadores multi-carácter en CSV,
+    así que se lee como texto plano y se parte con split().
     """
-    schema = StructType([
-        StructField("userId",    IntegerType(), True),
-        StructField("movieId",   IntegerType(), True),
-        StructField("rating",    DoubleType(),  True),
-        StructField("timestamp", IntegerType(), True),
-    ])
-    path = get_path(data_path, "u1.base")
-    return spark.read.csv(path, sep="\t", schema=schema)
-
-
-def load_users(spark: SparkSession, data_path: str):
-    """Carga la información demográfica de los usuarios desde u.user.
-    Columnas: userId | age | gender | occupation | zipCode
-    """
-    schema = StructType([
-        StructField("userId",     IntegerType(), True),
-        StructField("age",        IntegerType(), True),
-        StructField("gender",     StringType(),  True),
-        StructField("occupation", StringType(),  True),
-        StructField("zipCode",    StringType(),  True),
-    ])
-    path = get_path(data_path, "u.user")
-    return spark.read.csv(path, sep="|", schema=schema)
-
-
-def load_movies(spark: SparkSession, data_path: str):
-    """Carga la información de películas desde u.item.
-    El archivo está codificado en ISO-8859-1 y usa '|' como separador.
-    Las últimas 19 columnas son indicadores de género binarios.
-    """
-    fields = [
-        StructField("movieId",          IntegerType(), True),
-        StructField("title",            StringType(),  True),
-        StructField("releaseDate",      StringType(),  True),
-        StructField("videoReleaseDate", StringType(),  True),
-        StructField("imdbUrl",          StringType(),  True),
-    ]
-    for g in GENRE_NAMES:
-        fields.append(StructField(g, IntegerType(), True))
-
-    path = get_path(data_path, "u.item")
-    return spark.read.csv(
-        path, sep="|", schema=StructType(fields), encoding="ISO-8859-1"
+    raw = spark.read.text(path)
+    split_col = F.split(F.col("value"), "::")
+    return raw.select(
+        *[split_col[i].alias(name) for i, name in enumerate(col_names)]
     )
+
+
+def load_ratings(spark: SparkSession, data_path: str, dataset_format: str = "100k"):
+    """Carga los ratings.
+
+    ML-100K: u1.base     → userId \\t movieId \\t rating \\t timestamp
+    ML-1M:   ratings.dat → userId::movieId::rating::timestamp
+    """
+    col_names = ["userId", "movieId", "rating", "timestamp"]
+    cast_map  = [IntegerType(), IntegerType(), DoubleType(), IntegerType()]
+
+    if dataset_format == "1m":
+        df = _read_coloncolon(spark, get_path(data_path, "ratings.dat"), col_names)
+    else:
+        schema = StructType([StructField(c, t, True) for c, t in zip(col_names, cast_map)])
+        df = spark.read.csv(get_path(data_path, "u1.base"), sep="\t", schema=schema)
+
+    for col_name, col_type in zip(col_names, cast_map):
+        df = df.withColumn(col_name, F.col(col_name).cast(col_type))
+    return df
+
+
+def load_users(spark: SparkSession, data_path: str, dataset_format: str = "100k"):
+    """Carga la información demográfica de los usuarios.
+
+    ML-100K: u.user    → userId | age | gender | occupation | zipCode  (sep='|')
+    ML-1M:   users.dat → userId::gender::age::occupation::zipCode
+             Nota: en ML-1M el orden de gender y age está invertido.
+             La edad es un código categórico (1,18,25,35,45,50,56).
+             La ocupación ya es un entero 0-20.
+    """
+    if dataset_format == "1m":
+        col_names = ["userId", "gender", "age", "occupation", "zipCode"]
+        df = _read_coloncolon(spark, get_path(data_path, "users.dat"), col_names)
+        df = (df
+              .withColumn("userId",     F.col("userId").cast(IntegerType()))
+              .withColumn("age",        F.col("age").cast(IntegerType()))
+              .withColumn("occupation", F.col("occupation").cast(IntegerType()))
+              )
+    else:
+        schema = StructType([
+            StructField("userId",     IntegerType(), True),
+            StructField("age",        IntegerType(), True),
+            StructField("gender",     StringType(),  True),
+            StructField("occupation", StringType(),  True),
+            StructField("zipCode",    StringType(),  True),
+        ])
+        df = spark.read.csv(get_path(data_path, "u.user"), sep="|", schema=schema)
+    return df
+
+
+def load_movies(spark: SparkSession, data_path: str, dataset_format: str = "100k"):
+    """Carga la información de películas y crea columnas de género binarias.
+
+    ML-100K: u.item      → columnas binarias de género ya vienen en el archivo.
+    ML-1M:   movies.dat  → géneros como texto pipe-separated (ej. 'Action|Comedy').
+                           Se expanden a las mismas columnas binarias que ML-100K.
+    El resultado siempre expone las columnas de GENRE_NAMES.
+    """
+    if dataset_format == "1m":
+        col_names = ["movieId", "title", "genres_str"]
+        df = _read_coloncolon(spark, get_path(data_path, "movies.dat"), col_names)
+        df = df.withColumn("movieId", F.col("movieId").cast(IntegerType()))
+        for ml1m_name, col_name in ML1M_GENRE_MAP.items():
+            df = df.withColumn(
+                col_name,
+                F.when(F.col("genres_str").contains(ml1m_name), 1).otherwise(0)
+            )
+        df = df.withColumn("unknown", F.lit(0))  # ML-1M no tiene género "unknown"
+        return df.drop("genres_str")
+    else:
+        fields = [
+            StructField("movieId",          IntegerType(), True),
+            StructField("title",            StringType(),  True),
+            StructField("releaseDate",      StringType(),  True),
+            StructField("videoReleaseDate", StringType(),  True),
+            StructField("imdbUrl",          StringType(),  True),
+        ]
+        for g in GENRE_NAMES:
+            fields.append(StructField(g, IntegerType(), True))
+        return spark.read.csv(
+            get_path(data_path, "u.item"),
+            sep="|", schema=StructType(fields), encoding="ISO-8859-1"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -228,7 +312,7 @@ def exploratory_analysis(ratings, users, movies):
 # 2. Construcción de features
 # ---------------------------------------------------------------------------
 
-def build_user_features(ratings, users, movies):
+def build_user_features(ratings, users, movies, dataset_format: str = "100k"):
     """Construye el vector de características por usuario.
 
     Estrategia de feature engineering:
@@ -281,17 +365,27 @@ def build_user_features(ratings, users, movies):
         "gender_num", F.when(F.col("gender") == "F", 1.0).otherwise(0.0)
     )
 
-    # Codificar ocupación numéricamente
-    occ_indexer = StringIndexer(
-        inputCol="occupation", outputCol="occupation_idx", handleInvalid="keep"
-    )
-    users_indexed = occ_indexer.fit(users_enc).transform(users_enc)
-    user_demo = users_indexed.select(
-        "userId",
-        F.col("age").cast(DoubleType()).alias("age"),
-        "gender_num",
-        "occupation_idx",
-    )
+    # Codificar ocupación numéricamente.
+    # ML-100K: texto libre → StringIndexer asigna índices.
+    # ML-1M: ya es entero 0-20 → cast directo a double.
+    if dataset_format == "1m":
+        user_demo = users_enc.select(
+            "userId",
+            F.col("age").cast(DoubleType()).alias("age"),
+            "gender_num",
+            F.col("occupation").cast(DoubleType()).alias("occupation_idx"),
+        )
+    else:
+        occ_indexer = StringIndexer(
+            inputCol="occupation", outputCol="occupation_idx", handleInvalid="keep"
+        )
+        users_indexed = occ_indexer.fit(users_enc).transform(users_enc)
+        user_demo = users_indexed.select(
+            "userId",
+            F.col("age").cast(DoubleType()).alias("age"),
+            "gender_num",
+            "occupation_idx",
+        )
 
     # --- Unión de todas las features ---
     user_features = (
@@ -475,6 +569,12 @@ def main():
         print(f"Modo LOCAL — dataset: {data_path}")
 
     # -----------------------------------------------------------------------
+    # Detectar formato del dataset
+    # -----------------------------------------------------------------------
+    dataset_format = detect_format(data_path)
+    print(f"Formato dataset : MovieLens {'1M' if dataset_format == '1m' else '100K'}")
+
+    # -----------------------------------------------------------------------
     # Conector GCS: descarga automática y distribución a workers si es necesario
     # -----------------------------------------------------------------------
     gcs_jar = ""
@@ -490,9 +590,9 @@ def main():
     # -----------------------------------------------------------------------
     # Carga de datos
     # -----------------------------------------------------------------------
-    ratings = load_ratings(spark, data_path)
-    users   = load_users(spark, data_path)
-    movies  = load_movies(spark, data_path)
+    ratings = load_ratings(spark, data_path, dataset_format)
+    users   = load_users(spark, data_path, dataset_format)
+    movies  = load_movies(spark, data_path, dataset_format)
 
     # -----------------------------------------------------------------------
     # 1. Análisis exploratorio
@@ -502,7 +602,7 @@ def main():
     # -----------------------------------------------------------------------
     # 2 & 3. Feature engineering + preparación
     # -----------------------------------------------------------------------
-    user_features, feature_cols = build_user_features(ratings, users, movies)
+    user_features, feature_cols = build_user_features(ratings, users, movies, dataset_format)
     scaled = prepare_features(user_features, feature_cols)
 
     # -----------------------------------------------------------------------
